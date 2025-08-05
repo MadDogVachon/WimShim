@@ -1,0 +1,79 @@
+***************
+*** 2,10 ****
+  #define SHIM_WIMLIB_H
+  
+  #include <wchar.h>
+  #include <stdint.h>
+  #include <stddef.h>   /* size_t */
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
+  
+--- 2,11 ----
+  #define SHIM_WIMLIB_H
+  
+  #include <wchar.h>
+  #include <stdint.h>
+  #include <stddef.h>   /* size_t */
++ 
+  #ifdef __cplusplus
+  extern "C" {
+  #endif
+  
+*************** extern "C" {
+*** 68,88 ****
+          int* retCode,
+          size_t* sizeChars);
+  
+-     /* Capture (asynchrone interne) */
+-     __declspec(dllexport) int __cdecl Wim_StartCapture(const wchar_t* srcDir,
+-         const wchar_t* destWim,
+-         int compressionType,
+-         int addFlags,
+-         int writeFlags,
+-         uint32_t chunkSizeBytes);
+      __declspec(dllexport) int __cdecl Wim_QueryCapture(int* status,
+          int* percent,
+          int* elapsed_s,
+          int* remaining_s,
+          int* retcode);
+      __declspec(dllexport) int __cdecl Wim_WaitCapture(void);
+  
+-     /* Append (asynchrone interne) */
+      /* compType: -1 = conserver compression actuelle du WIM. */
+      /* chunkSz: ignoré sauf si compType >= 0 ET appelant fournit RECOMPRESS/REBUILD. */
+-     __declspec(dllexport) int __cdecl Wim_StartAppend(
+--- 69,101 ----
+          int* retCode,
+          size_t* sizeChars);
+  
++     /* ================================================================
++      * CAPTURE (asynchrone interne)
++      *
++      * imageName / imageDesc peuvent être NULL ou "".
++      *   - imageName vide  -> auto: Snapshot_YYYY-MM-DD_HH-MM-SS
++      *   - imageDesc vide  -> "No description"
++      *   (ancien comportement: dérivait du nom du dossier; conservé
++      *    en dernier recours si timestamp échoue.)
++      * ================================================================ */
++     __declspec(dllexport) int __cdecl Wim_StartCapture(
++         const wchar_t* srcDir,
++         const wchar_t* destWim,
++         const wchar_t* imageName,
++         const wchar_t* imageDesc,
++         int compressionType,
++         int addFlags,
++         int writeFlags,
++         uint32_t chunkSizeBytes);
+      __declspec(dllexport) int __cdecl Wim_QueryCapture(int* status,
+          int* percent,
+          int* elapsed_s,
+          int* remaining_s,
+          int* retcode);
+      __declspec(dllexport) int __cdecl Wim_WaitCapture(void);
+  
++     /* ================================================================
++      * APPEND (asynchrone interne)
++      * ================================================================ */
+      /* compType: -1 = conserver compression actuelle du WIM. */
+      /* chunkSz: ignoré sauf si compType >= 0 ET appelant fournit RECOMPRESS/REBUILD. */

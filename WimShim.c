@@ -1,0 +1,1336 @@
+﻿/*************************************************************
+ * WimShim.c – Interface C simplifiée (shim) vers wimlib.dll
+ *
+ * Exporte des fonctions Cdecl (voir WimShim.h) :
+ *   Version / Init / Error
+ *   Info : Wim_GetWimInfo, Wim_ListImages, Wim_GetImageInfo,
+ *          Wim_GetImageProperty, Wim_GetXml
+ *   Capture : Wim_StartCapture / Wim_QueryCapture / Wim_WaitCapture
+ *   Append  : Wim_StartAppend  / Wim_QueryAppend  / Wim_WaitAppend
+ *   Check   : Wim_StartCheck   / Wim_QueryCheck   / Wim_WaitCheck
+ *   Verify  : Wim_StartVerify  / Wim_QueryVerify  / Wim_WaitVerify
+ *
+ * Toutes les opérations "Start" sont lancées dans un thread interne.
+ * Un seul job actif par type (capture, append, check, verify).
+ *
+ * CAPTURE / APPEND (nom & description) :
+ *   - Si imageName == NULL ou vide => derive automatiquement depuis srcDir.
+ *   - Si imageDesc == NULL ou vide => "Captured from <basename>".
+ *   - Pour Append : même logique; on ajoute une image dans un WIM
+ *     existant (RW). Compression/chunk forcés seulement si CompressionType >= 0.
+ *
+ * NOTE COMPRESSION À L’APPEND :
+ *   - CompressionType == -1 : ne touche pas aux réglages d’écriture; image ajoutée
+ *     avec compression héritée de la session actuelle (celle du WIM).
+ *   - CompressionType >= 0  : on tente wimlib_set_output_compression_type().
+ *   - Pour réellement recalculer les flux existants, l’appelant doit
+ *     inclure WIMLIB_WRITE_FLAG_RECOMPRESS (et éventuellement REBUILD).
+ *************************************************************/
+
+#include <windows.h>
+#include <wchar.h>
+#include <time.h>
+#include <stdint.h>
+#include <process.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "wimlib.h"
+#include "WimShim.h"
+
+
+ /* ------------------------------------------------------------------ */
+ /* Helpers Interlocked                                                */
+ /* ------------------------------------------------------------------ */
+static __inline LONG atomic_read32(volatile LONG* p) {
+    return InterlockedCompareExchange(p, 0, 0);
+}
+static __inline void atomic_write32(volatile LONG* p, LONG v) {
+    InterlockedExchange(p, v);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* _countof helper                                                    */
+/* ------------------------------------------------------------------ */
+#ifndef _countof
+# define _countof(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
+
+/* ------------------------------------------------------------------ */
+/* Chunk tables                                                       */
+/* ------------------------------------------------------------------ */
+static const uint32_t g_allowed_xpress[] = {
+    4u * 1024u, 8u * 1024u, 16u * 1024u, 32u * 1024u, 64u * 1024u,
+};
+static const uint32_t g_allowed_lzx[] = {
+    32u * 1024u, 64u * 1024u, 128u * 1024u, 256u * 1024u,
+    512u * 1024u, 1u * 1024u * 1024u, 2u * 1024u * 1024u,
+};
+static const uint32_t g_allowed_lzms[] = {
+    32u * 1024u, 64u * 1024u, 128u * 1024u, 256u * 1024u,
+    512u * 1024u, 1u * 1024u * 1024u, 2u * 1024u * 1024u,
+    4u * 1024u * 1024u, 8u * 1024u * 1024u, 16u * 1024u * 1024u,
+    32u * 1024u * 1024u, 64u * 1024u * 1024u, 128u * 1024u * 1024u,
+    256u * 1024u * 1024u, 512u * 1024u * 1024u,
+    1u * 1024u * 1024u * 1024u,
+};
+
+static uint32_t nearest_allowed(uint32_t req, const uint32_t* tbl, size_t cnt)
+{
+    if (cnt == 0) return 0;
+    if (req <= tbl[0]) return tbl[0];
+    if (req >= tbl[cnt - 1]) return tbl[cnt - 1];
+    for (size_t i = 1; i < cnt; ++i) {
+        if (req == tbl[i]) return tbl[i];
+        if (req < tbl[i]) {
+            const uint32_t lo = tbl[i - 1];
+            const uint32_t hi = tbl[i];
+            return ((req - lo) <= (hi - req)) ? lo : hi;
+        }
+    }
+    return tbl[cnt - 1];
+}
+
+static uint32_t sanitize_chunk_size(enum wimlib_compression_type CompressionType, uint32_t req)
+{
+    if (req == 0)
+        return 0; /* auto */
+    switch (CompressionType) {
+    case WIMLIB_COMPRESSION_TYPE_XPRESS:
+        return nearest_allowed(req, g_allowed_xpress, _countof(g_allowed_xpress));
+    case WIMLIB_COMPRESSION_TYPE_LZX:
+        return nearest_allowed(req, g_allowed_lzx, _countof(g_allowed_lzx));
+    case WIMLIB_COMPRESSION_TYPE_LZMS:
+        return nearest_allowed(req, g_allowed_lzms, _countof(g_allowed_lzms));
+    default:
+        return 0;
+    }
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Auto image name / desc                                             */
+/* ------------------------------------------------------------------ */
+static void derive_image_name(const wchar_t* srcDir, wchar_t* out, size_t out_cch)
+{
+    if (!out || out_cch == 0) return;
+    out[0] = 0;
+
+    if (srcDir && *srcDir) {
+        /* last path component */
+        const wchar_t* p = srcDir;
+        const wchar_t* last = p;
+        while (*p) {
+            if (*p == L'\\' || *p == L'/') {
+                if (*(p + 1) != 0)
+                    last = p + 1;
+            }
+            ++p;
+        }
+        if (*last) {
+            wcsncpy_s(out, out_cch, last, _TRUNCATE);
+            return;
+        }
+    }
+    /* fallback */
+    ULONGLONG tick = GetTickCount64();
+    _snwprintf_s(out, out_cch, _TRUNCATE, L"Image_%llu", (unsigned long long)tick);
+}
+
+static void derive_image_desc(const wchar_t* srcDir, wchar_t* out, size_t out_cch)
+{
+    if (!out || out_cch == 0) return;
+    wchar_t tmp[260];
+    derive_image_name(srcDir, tmp, _countof(tmp));
+    _snwprintf_s(out, out_cch, _TRUNCATE, L"Captured from %s", tmp);
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Static info buffers (not re-entrant; copy if needed)               */
+/* ------------------------------------------------------------------ */
+#define SHIM_MAX_INFO_CHARS   (32 * 1024)
+static wchar_t g_InfoBuf[SHIM_MAX_INFO_CHARS];      /* reused by Wim_GetImageInfo / Wim_ListImages / Wim_GetXml */
+static wchar_t g_InfoPropBuf[2048];
+
+/* ================================================================== */
+/*  GLOBALS                                                           */
+/* ================================================================== */
+/*  GLOBALS : Capture                                                 */
+static HANDLE  g_hCaptureThread = NULL;
+static wchar_t g_CaptureSourcePath[MAX_PATH * 4];
+static wchar_t g_CaptureDestinationPath[MAX_PATH * 4];
+static wchar_t g_captureImageName[512];
+static wchar_t g_captureImageDesc[1024];
+
+static volatile LONG g_captureStatus = 0;  /* 0=idle,1=running,2=done,3=error */
+static volatile LONG g_capturePercent = 0;
+static volatile LONG g_capturePercentDecimal = 0;
+static volatile LONG g_captureElapsed = 0;
+static volatile LONG g_captureRemaining = 0;
+static volatile LONG g_captureRetcode = 0;
+
+static volatile LONG g_captureCompressionType = WIMLIB_COMPRESSION_TYPE_LZX;
+static volatile LONG g_captureCompressionLevel = 50;
+static volatile LONG g_captureAddFlags = 0;
+static volatile LONG g_captureWriteFlags = 0;
+static volatile LONG g_captureChunkSizeBytes = 0; /* 0 => auto */
+static volatile LONG g_captureThreadCount = 0;
+
+static time_t g_captureStartTime = 0;
+static volatile LONG g_capturePhase = 0;
+static time_t g_capturePhaseStartTime = 0;
+
+/*  GLOBALS : Append                                                  */
+static HANDLE  g_hAppendThread = NULL;
+static wchar_t g_AppendSourcePath[MAX_PATH * 4];
+static wchar_t g_AppendDestinationPath[MAX_PATH * 4];
+static wchar_t g_appendImageName[512];
+static wchar_t g_appendImageDesc[1024];
+
+static volatile LONG g_appendElapsed = 0;
+static volatile LONG g_appendPercent = 0;
+static volatile LONG g_appendPercentDecimal = 0;
+static volatile LONG g_appendStatus = 0;  /* 0=idle,1=running,2=done,3=error */
+static volatile LONG g_appendRemaining = 0;
+static volatile LONG g_appendRetcode = 0;
+
+static volatile LONG g_appendCompressionType = -1;     /* -1 = keep */
+static volatile LONG g_appendCompressionLevel = 50;
+static volatile LONG g_appendAddFlags = 0;
+static volatile LONG g_appendWriteFlags = 0;
+static volatile LONG g_appendChunkSizeBytes = 0;
+static volatile LONG g_appendThreadCount = 0;
+
+static time_t g_appendStartTime = 0;
+static volatile LONG g_appendPhase = 0;
+static time_t g_appendPhaseStartTime = 0;
+
+/*  GLOBALS : Apply                                                   */
+static wchar_t g_applyWimPath[MAX_PATH * 4];
+static wchar_t g_applyImageId[64];
+static wchar_t g_applyDestPath[MAX_PATH * 4];
+static volatile LONG g_applyFlags = 0;
+
+/*  GLOBALS : Extract                                                 */
+static volatile LONG g_extractElapsed = 0;
+static volatile LONG g_extractPercent = 0;
+static volatile LONG g_extractPercentDecimal = 0;
+static volatile LONG g_extractStatus = 0;  // 0=idle, 1=running, 2=done, 3=error
+static volatile LONG g_extractRemaining = 0;
+static volatile LONG g_extractRetcode = 0;
+
+static time_t g_extractStartTime = 0;
+static volatile LONG g_extractPhase = 0;
+static time_t g_extractPhaseStartTime = 0;
+
+/*  GLOBALS : Split                                                   */
+static volatile LONG g_splitPercent = 0;
+static volatile LONG g_splitPercentDecimal = 0;
+static volatile LONG g_splitStatus = 0;   // 0 = idle, 1 = running, 2 = done, 3 = error
+static volatile LONG g_splitRetcode = 0;
+
+/*  GLOBALS : Verify                                                  */
+static HANDLE  g_hVerifyThread = NULL;
+static wchar_t g_VerifyPath[MAX_PATH * 4];
+static volatile LONG g_verifyPercent = 0;
+static volatile LONG g_verifyPercentDecimal = 0;
+static volatile LONG g_verifyStatus = 0; /* 0=idle,1=running,2=done,3=error */
+static volatile LONG g_verifyRetcode = 0;
+static volatile LONG g_verifyFlags = 0;
+
+
+/* ================================================================== */
+/* % helpers                                                          */
+/* ================================================================== */
+static __inline int percent_from_u64(uint64_t done, uint64_t total, const char* Action)
+{
+    if (total == 0) return 0;
+
+    LONG nbDecimal;
+    // Logique adaptative basée sur la taille du total
+    if (total <= 1000000000ULL) { nbDecimal = 0; }        // <= 1 milliard    // Entier
+    else if (total <= 10000000000ULL) { nbDecimal = 1; }  // <= 10 milliard   // 1 décimale
+    else if (total <= 100000000000ULL) { nbDecimal = 2; } // <= 100 milliards // 2 décimales
+    else { nbDecimal = 3; }                               // > 100 milliards  // 3 décimales
+
+    if (Action != NULL) {
+        if (strcmp(Action, "capture") == 0) {
+            atomic_write32(&g_capturePercentDecimal, nbDecimal);
+        }
+        else if (strcmp(Action, "append") == 0) {
+            atomic_write32(&g_appendPercentDecimal, nbDecimal);
+        }
+        else if (strcmp(Action, "extract") == 0) {
+            atomic_write32(&g_extractPercentDecimal, nbDecimal);
+        }
+        else if (strcmp(Action, "split") == 0) {
+            atomic_write32(&g_splitPercentDecimal, nbDecimal);
+        }
+        else if (strcmp(Action, "verify") == 0) {
+            atomic_write32(&g_verifyPercentDecimal, nbDecimal);
+        }
+        else {
+            return 0;
+		}
+    }
+
+    if (done >= total) return 100;
+    double d = ((double)done * 100.0) / (double)total;
+    if (d < 0.0) d = 0.0;
+    if (d > 100.0) d = 100.0; // Ceci gérera aussi done >= total en le mettant à 100.0
+
+    return (int)(d * pow(10.0, (double)nbDecimal) + 0.5);
+}
+
+static void shim_wcsncpyz(wchar_t* dst, size_t cap, const wchar_t* src)
+{
+    if (!dst || cap == 0) return;
+    if (!src) {
+        dst[0] = L'\0';
+        return;
+    }
+    wcsncpy_s(dst, cap, src, _TRUNCATE);
+}
+
+/* Retourne chaîne propriété image; NULL => "" */
+static const wchar_t*
+shim_get_img_prop(WIMStruct* w, int idx, const wchar_t* prop)
+{
+    const wimlib_tchar* p = wimlib_get_image_property(w, idx, prop);
+    return (const wchar_t*)(p ? p : L"");
+}
+
+
+/* ================================================================== */
+/*  API EXPORTÉE – Version / Init / Error                             */
+/* ================================================================== */
+const wchar_t* __cdecl Wim_GetVersion(void)
+{
+    return (const wchar_t*)wimlib_get_version_string();
+}
+
+int __cdecl Wim_Init(void)
+{
+    return wimlib_global_init(0);
+}
+
+const wchar_t* __cdecl Wim_ErrorString(int code)
+{
+    return (const wchar_t*)wimlib_get_error_string((enum wimlib_error_code)code);
+}
+
+
+/* ================================================================== */
+/*  Wim_GetWimInfo                                                    */
+/* ================================================================== */
+int __cdecl Wim_GetWimInfo(const wchar_t* wimPath,
+    int* imageCount,
+    int* bootIndex,
+    int* compressionType,
+    int* hasIntegrity,
+    uint32_t* chunkSize,
+    uint64_t* totalBytes,
+    int* partNumber,
+    int* totalParts,
+    int* isReadonly)
+{
+    if (!wimPath)
+        return WIMLIB_ERR_INVALID_PARAM;
+
+    WIMStruct* w = NULL;
+    /* Open read-only */
+    int ret = wimlib_open_wim(wimPath, 0, &w);
+    if (ret != 0)
+        return ret;
+
+    struct wimlib_wim_info info;
+    ret = wimlib_get_wim_info(w, &info);
+    if (ret == 0) {
+        if (imageCount)      *imageCount = (int)info.image_count;
+        if (bootIndex)       *bootIndex = (int)info.boot_index;
+        if (compressionType) *compressionType = (int)info.compression_type;
+        if (hasIntegrity)    *hasIntegrity = info.has_integrity_table ? 1 : 0;
+        if (chunkSize)       *chunkSize = info.chunk_size;
+        if (totalBytes)      *totalBytes = info.total_bytes;
+        if (partNumber)      *partNumber = (int)info.part_number;
+        if (totalParts)      *totalParts = (int)info.total_parts;
+        if (isReadonly)      *isReadonly = (info.is_readonly || info.is_marked_readonly) ? 1 : 0;
+    }
+
+    wimlib_free(w);
+    return ret;
+}
+
+
+/* ================================================================== */
+/*  Progress callbacks                                                */
+/* ================================================================== */
+
+/* Capture */
+static enum wimlib_progress_status __cdecl
+ProgressCallBack_Capture(enum wimlib_progress_msg msg,
+    union wimlib_progress_info* info,
+    void* ctx)
+{
+    (void)ctx;
+
+    time_t now = time(NULL);
+    int elapsed = 0;
+    int percent = 0;
+    int remain = 0;
+
+    switch (msg) {
+
+    case WIMLIB_PROGRESS_MSG_WRITE_STREAMS: {
+        /* Phase données */
+        if (atomic_read32(&g_capturePhase) != 0) {
+            atomic_write32(&g_capturePhase, 0);
+            g_capturePhaseStartTime = g_captureStartTime;
+        }
+        uint64_t done = info->write_streams.completed_bytes;
+        uint64_t total = info->write_streams.total_bytes;
+        percent = percent_from_u64(done, total, "capture");
+        atomic_write32(&g_capturePercent, percent);
+        percent = (int)(percent / pow(10.0, (double)atomic_read32(&g_capturePercentDecimal)));
+
+        elapsed = (int)difftime(now, g_captureStartTime);
+        if (percent > 0 && percent < 100) {
+            double spp = (double)elapsed / (double)percent;
+            remain = (int)((100.0 - percent) * spp);
+        }
+        break;
+    }
+
+    case WIMLIB_PROGRESS_MSG_CALC_INTEGRITY: {
+        /* Phase intégrité (table) */
+        if (atomic_read32(&g_capturePhase) != 1) {
+            atomic_write32(&g_capturePhase, 1);
+            g_capturePhaseStartTime = now; /* compteur propre à la phase */
+        }
+        uint64_t done = info->integrity.completed_bytes;
+        uint64_t total = info->integrity.total_bytes;
+        percent = percent_from_u64(done, total, "capture");
+        atomic_write32(&g_capturePercent, percent);
+        percent = (int)(percent / pow(10.0, (double)atomic_read32(&g_capturePercentDecimal)));
+
+        elapsed = (int)difftime(now, g_capturePhaseStartTime);
+        if (percent > 0 && percent < 100) {
+            double spp = (double)elapsed / (double)percent;
+            remain = (int)((100.0 - percent) * spp);
+        }
+        break;
+    }
+
+    case WIMLIB_PROGRESS_MSG_WRITE_METADATA_END:
+        /* ne rien forcer à 100 ici : la phase intégrité suit éventuellement */
+        elapsed = (int)difftime(now, g_captureStartTime);
+        break;
+
+    default:
+        /* messages ignorés */
+        elapsed = (int)difftime(now, g_captureStartTime);
+        break;
+    }
+
+    atomic_write32(&g_captureElapsed, elapsed);
+    atomic_write32(&g_captureRemaining, remain);
+    return WIMLIB_PROGRESS_STATUS_CONTINUE;
+}
+
+/* Append */
+static enum wimlib_progress_status __cdecl
+ProgressCallBack_Append(enum wimlib_progress_msg msg,
+    union wimlib_progress_info* info,
+    void* ctx)
+{
+    (void)ctx;
+
+    time_t now = time(NULL);
+    int elapsed = 0;
+    int percent = 0;
+    int remain = 0;
+
+    switch (msg) {
+
+    case WIMLIB_PROGRESS_MSG_SCAN_BEGIN:
+        atomic_write32(&g_appendPhase, 0);
+        atomic_write32(&g_appendPercent, 0);
+        g_appendPhaseStartTime = g_appendStartTime;
+        break;
+
+    case WIMLIB_PROGRESS_MSG_WRITE_STREAMS: {
+        /* Phase données */
+        if (atomic_read32(&g_appendPhase) != 0) {
+            atomic_write32(&g_appendPhase, 0);
+            g_appendPhaseStartTime = g_appendStartTime;
+        }
+        uint64_t done = info->write_streams.completed_bytes;
+        uint64_t total = info->write_streams.total_bytes;
+        percent = percent_from_u64(done, total, "append");
+        atomic_write32(&g_appendPercent, percent);
+        percent = (int)(percent / pow(10.0, (double)atomic_read32(&g_appendPercentDecimal)));
+
+        elapsed = (int)difftime(now, g_appendStartTime);
+        if (percent > 0 && percent < 100) {
+            double spp = (double)elapsed / (double)percent;
+            remain = (int)((100.0 - percent) * spp);
+        }
+        break;
+    }
+
+    case WIMLIB_PROGRESS_MSG_CALC_INTEGRITY: {
+        /* Phase intégrité */
+        if (atomic_read32(&g_appendPhase) != 1) {
+            atomic_write32(&g_appendPhase, 1);
+            g_appendPhaseStartTime = now;
+        }
+        uint64_t done = info->integrity.completed_bytes;
+        uint64_t total = info->integrity.total_bytes;
+        percent = percent_from_u64(done, total, "append");
+        atomic_write32(&g_appendPercent, percent);
+        percent = (int)(percent / pow(10.0, (double)atomic_read32(&g_appendPercentDecimal)));
+
+        elapsed = (int)difftime(now, g_appendPhaseStartTime);
+        if (percent > 0 && percent < 100) {
+            double spp = (double)elapsed / (double)percent;
+            remain = (int)((100.0 - percent) * spp);
+        }
+        break;
+    }
+
+    case WIMLIB_PROGRESS_MSG_WRITE_METADATA_END:
+        /* pas de 100 ici (phase intégrité ensuite) */
+        elapsed = (int)difftime(now, g_appendStartTime);
+        break;
+
+    default:
+        elapsed = (int)difftime(now, g_appendStartTime);
+        break;
+    }
+
+    atomic_write32(&g_appendElapsed, elapsed);
+    atomic_write32(&g_appendRemaining, remain);
+    return WIMLIB_PROGRESS_STATUS_CONTINUE;
+}
+
+/* Extract */
+static enum wimlib_progress_status __cdecl
+ProgressCallBack_Extract(enum wimlib_progress_msg msg,
+    union wimlib_progress_info* info,
+    void* ctx)
+    {
+    (void)ctx;
+    time_t now = time(NULL);
+
+    int elapsed = 0;
+    int percent = 0;
+    int remain = 0;
+
+    switch (msg) {
+
+
+        /*  WIMLIB_PROGRESS_MSG_EXTRACT_IMAGE_BEGIN = 0,
+            WIMLIB_PROGRESS_MSG_EXTRACT_TREE_BEGIN = 1,
+            WIMLIB_PROGRESS_MSG_EXTRACT_FILE_STRUCTURE = 3,
+            WIMLIB_PROGRESS_MSG_EXTRACT_STREAMS = 4,
+            WIMLIB_PROGRESS_MSG_EXTRACT_SPWM_PART_BEGIN = 5,
+            WIMLIB_PROGRESS_MSG_EXTRACT_METADATA = 6,
+            WIMLIB_PROGRESS_MSG_EXTRACT_IMAGE_END = 7,
+            WIMLIB_PROGRESS_MSG_EXTRACT_TREE_END = 8,*/
+
+    case WIMLIB_PROGRESS_MSG_EXTRACT_IMAGE_BEGIN:
+        atomic_write32(&g_extractPhase, 0);
+        atomic_write32(&g_extractPercent, 0);
+        g_extractStartTime = now;
+        g_extractPhaseStartTime = now;
+        atomic_write32(&g_extractStatus, 1); // running
+        break;
+
+    case WIMLIB_PROGRESS_MSG_EXTRACT_METADATA:
+        // Ce message est envoyé au début et à la fin de l'extraction des métadonnées.
+        // Tu peux y inclure un indicateur si tu veux suivre ces étapes.
+        break;
+
+    case WIMLIB_PROGRESS_MSG_EXTRACT_STREAMS: {
+        if (atomic_read32(&g_extractPhase) != 0) {
+            atomic_write32(&g_extractPhase, 0);
+            g_extractPhaseStartTime = g_extractStartTime;
+        }
+        const struct wimlib_progress_info_extract* p = &info->extract;
+        if (p->total_streams > 0) {
+            uint64_t done = p->completed_streams;   // completed_bytes
+            uint64_t total = p->total_streams;      // total_bytes
+            percent = percent_from_u64(done, total, "extract");
+            atomic_write32(&g_extractPercent, percent);
+        }
+
+        elapsed = (int)difftime(now, g_extractStartTime);
+        if (percent > 0 && percent < 100) {
+            double spp = (double)elapsed / (double)percent;
+            remain = (int)((100.0 - percent) * spp);
+        }
+        break;
+    }
+
+    case WIMLIB_PROGRESS_MSG_EXTRACT_IMAGE_END:
+        /* pas de 100 ici (phase intégrité ensuite) */
+        elapsed = (int)difftime(now, g_extractStartTime);
+        break;
+
+    default:
+        elapsed = (int)difftime(now, g_extractStartTime);
+        break;
+    }
+
+    atomic_write32(&g_extractElapsed, elapsed);
+    atomic_write32(&g_extractRemaining, remain);
+    return WIMLIB_PROGRESS_STATUS_CONTINUE;
+}
+
+/* Split */
+static enum wimlib_progress_status __cdecl
+ProgressCallBack_Split(enum wimlib_progress_msg msg,
+    const void* info,
+    void* ctx)
+{
+    (void)ctx;
+    switch (msg) {
+    case WIMLIB_PROGRESS_MSG_WRITE_STREAMS: {
+        const struct wimlib_progress_info_write_streams* p = info;
+        if (p->total_streams > 0) {
+            int percent = percent_from_u64(p->completed_streams, p->total_streams, "append");
+            atomic_write32(&g_splitPercent, percent);
+        }
+        break;
+    }
+    case WIMLIB_PROGRESS_MSG_SPLIT_BEGIN_PART:
+        atomic_write32(&g_splitStatus, 1); /* running */
+        atomic_write32(&g_splitPercent, 0);
+        atomic_write32(&g_splitPercentDecimal, 0);
+        atomic_write32(&g_splitRetcode, 0);
+        break;
+    case WIMLIB_PROGRESS_MSG_SPLIT_END_PART:
+        atomic_write32(&g_splitStatus, 2); /* done */
+        atomic_write32(&g_splitPercent, 100);
+        atomic_write32(&g_splitPercentDecimal, 0);
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+/* Verify */
+static enum wimlib_progress_status __cdecl
+ProgressCallBack_Verify(enum wimlib_progress_msg msg,
+    union wimlib_progress_info* info,
+    void* ctx)
+{
+    (void)ctx;
+    if (msg == WIMLIB_PROGRESS_MSG_VERIFY_STREAMS) {
+        uint64_t done = info->verify_streams.completed_bytes;
+        uint64_t total = info->verify_streams.total_bytes;
+        atomic_write32(&g_verifyPercent, percent_from_u64(done, total, "verify"));
+    }
+    return WIMLIB_PROGRESS_STATUS_CONTINUE;
+}
+
+
+/*     ===== ===== ===== ===== =====     ===== ===== ===== ===== =====     ===== ===== ===== ===== =====     ===== ===== ===== ===== =====     ===== ===== ===== ===== =====     */
+
+
+/* ================================================================== */
+/*  HelloWorld                                                        */
+/* ================================================================== */
+__declspec(dllexport) const char* HelloWorld(void) {
+    return "Hello World from DLL!";
+}
+
+
+/* ================================================================== */
+/*  Wim Informations                                                  */
+/* ================================================================== */
+const wchar_t* __cdecl Wim_ListImages(const wchar_t* wimPath, int* retCode, int* imageCount)
+{
+    if (retCode)    *retCode = WIMLIB_ERR_INVALID_PARAM;
+    if (imageCount) *imageCount = 0;
+    g_InfoBuf[0] = L'\0';
+
+    if (!wimPath)
+        return g_InfoBuf;
+
+    WIMStruct* w = NULL;
+    int r = wimlib_open_wim(wimPath, 0, &w);
+    if (retCode) *retCode = r;
+    if (r != 0) {
+        if (w) wimlib_free(w);
+        return g_InfoBuf;
+    }
+
+    struct wimlib_wim_info wi;
+    r = wimlib_get_wim_info(w, &wi);
+    if (retCode) *retCode = r;
+    if (r != 0) {
+        wimlib_free(w);
+        return g_InfoBuf;
+    }
+    if (imageCount) *imageCount = (int)wi.image_count;
+
+    /* Build lines */
+    wchar_t* p = g_InfoBuf;
+    size_t  cap = SHIM_MAX_INFO_CHARS;
+    p[0] = L'\0';
+
+    for (int i = 1; i <= (int)wi.image_count; i++) {
+        const wchar_t* nm = shim_get_img_prop(w, i, L"NAME");
+        const wchar_t* desc = shim_get_img_prop(w, i, L"DESCRIPTION");
+        const wchar_t* fls = shim_get_img_prop(w, i, L"FLAGS");
+        int wrote = _snwprintf_s(p, cap, _TRUNCATE, L"%d|%s|%s|%s\n", i, nm, desc, fls);
+        if (wrote < 0)
+            break;
+        size_t used = wcsnlen_s(p, cap);
+        p += used;
+        if (used >= cap)
+            break;
+        cap -= used;
+    }
+
+    wimlib_free(w);
+    return g_InfoBuf;
+}
+
+const wchar_t* __cdecl Wim_GetImageInfo(const wchar_t* wimPath,
+    int imageIndex,
+    int* retCode,
+    int* isBoot)
+{
+    if (retCode) *retCode = WIMLIB_ERR_INVALID_PARAM;
+    if (isBoot)  *isBoot = 0;
+    g_InfoBuf[0] = L'\0';
+
+    if (!wimPath || imageIndex <= 0)
+        return g_InfoBuf;
+
+    WIMStruct* w = NULL;
+    int r = wimlib_open_wim(wimPath, 0, &w);
+    if (retCode) *retCode = r;
+    if (r != 0) {
+        if (w) wimlib_free(w);
+        return g_InfoBuf;
+    }
+
+    struct wimlib_wim_info wi;
+    r = wimlib_get_wim_info(w, &wi);
+    if (retCode) *retCode = r;
+    if (r != 0) {
+        wimlib_free(w);
+        return g_InfoBuf;
+    }
+
+    if (isBoot)
+        *isBoot = ((int)wi.boot_index == imageIndex) ? 1 : 0;
+
+    /* Gather props */
+    const wchar_t* nm = shim_get_img_prop(w, imageIndex, L"NAME");
+    const wchar_t* desc = shim_get_img_prop(w, imageIndex, L"DESCRIPTION");
+    const wchar_t* flags = shim_get_img_prop(w, imageIndex, L"FLAGS");
+    const wchar_t* dirs = shim_get_img_prop(w, imageIndex, L"DIRCOUNT");
+    const wchar_t* files = shim_get_img_prop(w, imageIndex, L"FILECOUNT");
+    const wchar_t* tot = shim_get_img_prop(w, imageIndex, L"TOTAL_BYTES");
+    const wchar_t* hlbytes = shim_get_img_prop(w, imageIndex, L"HARDLINK_BYTES");
+    const wchar_t* ctime = shim_get_img_prop(w, imageIndex, L"CREATIONTIME");
+    const wchar_t* mtime = shim_get_img_prop(w, imageIndex, L"LASTMODTIME");
+
+    _snwprintf_s(g_InfoBuf, _countof(g_InfoBuf), _TRUNCATE,
+        L"%s|%s|%s|%s|%s|%s|%s|%s|%s",
+        nm, desc, flags, dirs, files, tot, hlbytes, ctime, mtime);
+
+    wimlib_free(w);
+    return g_InfoBuf;
+}
+
+const wchar_t* __cdecl Wim_GetImageProperty(const wchar_t* wimPath,
+    int imageIndex,
+    const wchar_t* propName,
+    int* retCode)
+{
+    if (retCode) *retCode = WIMLIB_ERR_INVALID_PARAM;
+    g_InfoPropBuf[0] = L'\0';
+
+    if (!wimPath || !propName || imageIndex <= 0)
+        return g_InfoPropBuf;
+
+    WIMStruct* w = NULL;
+    int r = wimlib_open_wim(wimPath, 0, &w);
+    if (retCode) *retCode = r;
+    if (r != 0) {
+        if (w) wimlib_free(w);
+        return g_InfoPropBuf;
+    }
+
+    const wchar_t* val = shim_get_img_prop(w, imageIndex, propName);
+    shim_wcsncpyz(g_InfoPropBuf, _countof(g_InfoPropBuf), val);
+
+    wimlib_free(w);
+    return g_InfoPropBuf;
+}
+
+const wchar_t* __cdecl Wim_GetXml(const wchar_t* wimPath,
+    int* retCode,
+    size_t* sizeChars)
+{
+    if (retCode)   *retCode = WIMLIB_ERR_INVALID_PARAM;
+    if (sizeChars) *sizeChars = 0;
+    g_InfoBuf[0] = L'\0';
+
+    if (!wimPath)
+        return g_InfoBuf;
+
+    WIMStruct* w = NULL;
+    int r = wimlib_open_wim(wimPath, 0, &w);
+    if (retCode) *retCode = r;
+    if (r != 0) {
+        if (w) wimlib_free(w);
+        return g_InfoBuf;
+    }
+
+    void* xmlbuf = NULL;
+    size_t xmlsz = 0;
+    r = wimlib_get_xml_data(w, &xmlbuf, &xmlsz); /* UTF-8 buffer */
+    if (retCode) *retCode = r;
+    if (r != 0 || !xmlbuf) {
+        wimlib_free(w);
+        return g_InfoBuf;
+    }
+
+    int needed = MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)xmlbuf, (int)xmlsz, NULL, 0);
+    if (needed <= 0) {
+        wimlib_free(w);
+        return g_InfoBuf;
+    }
+    if ((size_t)needed >= _countof(g_InfoBuf))
+        needed = (int)(_countof(g_InfoBuf) - 1);
+
+    MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)xmlbuf, (int)xmlsz, g_InfoBuf, needed);
+    g_InfoBuf[needed] = L'\0';
+    if (sizeChars) *sizeChars = (size_t)needed;
+
+    wimlib_free(w);
+    return g_InfoBuf;
+}
+
+
+/* ================================================================== */
+/*  CAPTURE                                                           */
+/* ================================================================== */
+static unsigned __stdcall CaptureThread(void* unused)
+{
+    (void)unused;
+    atomic_write32(&g_captureStatus, 1); /* running */
+    g_captureStartTime = time(NULL);
+    atomic_write32(&g_capturePhase, 0);
+    g_capturePhaseStartTime = g_captureStartTime;
+    atomic_write32(&g_capturePercent, 0);
+    atomic_write32(&g_captureElapsed, 0);
+    atomic_write32(&g_captureRemaining, 0);
+    atomic_write32(&g_captureRetcode, 0);
+
+    enum wimlib_compression_type CompressionType = (enum wimlib_compression_type)atomic_read32(&g_captureCompressionType);
+    int CompressionLevel = atomic_read32(&g_captureCompressionLevel);
+    int addFlags = atomic_read32(&g_captureAddFlags);
+    int writeFlags = atomic_read32(&g_captureWriteFlags);
+    uint32_t chunkReq = (uint32_t)atomic_read32(&g_captureChunkSizeBytes);
+    uint32_t chunkSize = sanitize_chunk_size(CompressionType, chunkReq);
+    int threads = atomic_read32(&g_captureThreadCount);
+
+    /* Local copies of name/desc */
+    wchar_t nameBuf[512];
+    wchar_t descBuf[1024];
+    const wchar_t* nm = g_captureImageName;
+    const wchar_t* ds = g_captureImageDesc;
+    if (!nm || !*nm) {
+        derive_image_name(g_CaptureSourcePath, nameBuf, _countof(nameBuf));
+        nm = nameBuf;
+    }
+    if (!ds || !*ds) {
+        derive_image_desc(g_CaptureSourcePath, descBuf, _countof(descBuf));
+        ds = descBuf;
+    }
+
+    WIMStruct* Wim = NULL;
+    int ret = wimlib_create_new_wim(CompressionType, &Wim);
+    if (ret != 0) goto done;
+
+    if (CompressionLevel > 0)
+        (void)wimlib_set_default_compression_level(CompressionType, (unsigned int)CompressionLevel);
+
+    /* capture source -> new image w/ name */
+    ret = wimlib_add_image(Wim, g_CaptureSourcePath, nm, NULL, addFlags);
+    if (ret != 0) { wimlib_free(Wim); goto done; }
+
+    /* set description (image just added = #1) */
+    (void)wimlib_set_image_descripton(Wim, 1, ds);
+
+    wimlib_register_progress_function(Wim, ProgressCallBack_Capture, NULL);
+
+    if (chunkSize > 0)
+        (void)wimlib_set_output_chunk_size(Wim, chunkSize);
+
+    ret = wimlib_write(Wim, g_CaptureDestinationPath, WIMLIB_ALL_IMAGES, writeFlags, threads);
+    wimlib_free(Wim);
+
+done:
+    atomic_write32(&g_captureRetcode, ret);
+    if (ret == 0) atomic_write32(&g_capturePercent, 100);
+    atomic_write32(&g_captureStatus, (ret == 0) ? 2 : 3);
+    _endthreadex(0);
+    return 0;
+}
+
+int __cdecl Wim_StartCapture(const wchar_t* srcDir,
+    const wchar_t* destWim,
+    const wchar_t* imageName,
+    const wchar_t* imageDesc,
+    int compressionType,
+    int CompressionLevel,
+    int addFlags,
+    int writeFlags,
+    uint32_t chunkSizeBytes,
+    int threadCount)
+{
+    if (!srcDir || !destWim)
+        return WIMLIB_ERR_INVALID_PARAM;
+
+    if (atomic_read32(&g_captureStatus) == 1)
+        return -100; /* capture déjà en cours */
+
+    wcsncpy_s(g_CaptureSourcePath, _countof(g_CaptureSourcePath), srcDir, _TRUNCATE);
+    wcsncpy_s(g_CaptureDestinationPath, _countof(g_CaptureDestinationPath), destWim, _TRUNCATE);
+
+    /* store name/desc (may be empty) */
+    if (imageName)
+        wcsncpy_s(g_captureImageName, _countof(g_captureImageName), imageName, _TRUNCATE);
+    else
+        g_captureImageName[0] = 0;
+    if (imageDesc)
+        wcsncpy_s(g_captureImageDesc, _countof(g_captureImageDesc), imageDesc, _TRUNCATE);
+    else
+        g_captureImageDesc[0] = 0;
+
+    /* compression */
+    switch (compressionType) {
+    case WIMLIB_COMPRESSION_TYPE_NONE:
+    case WIMLIB_COMPRESSION_TYPE_XPRESS:
+    case WIMLIB_COMPRESSION_TYPE_LZX:
+    case WIMLIB_COMPRESSION_TYPE_LZMS:
+        atomic_write32(&g_captureCompressionType, compressionType);
+        break;
+    default:
+        atomic_write32(&g_captureCompressionType, WIMLIB_COMPRESSION_TYPE_LZX);
+        break;
+    }
+
+    atomic_write32(&g_captureCompressionLevel, CompressionLevel);
+    atomic_write32(&g_captureAddFlags, addFlags);
+    atomic_write32(&g_captureWriteFlags, writeFlags);
+    atomic_write32(&g_captureChunkSizeBytes, (LONG)chunkSizeBytes);
+    atomic_write32(&g_captureThreadCount, threadCount);
+
+    /* reset état */
+    atomic_write32(&g_captureStatus, 0);
+    atomic_write32(&g_capturePercent, 0);
+    atomic_write32(&g_captureElapsed, 0);
+    atomic_write32(&g_captureRemaining, 0);
+    atomic_write32(&g_captureRetcode, 0);
+
+    uintptr_t th = _beginthreadex(NULL, 0, CaptureThread, NULL, 0, NULL);
+    if (!th)
+        return -101;
+    g_hCaptureThread = (HANDLE)th;
+
+    atomic_write32(&g_capturePhase, 0);
+    g_capturePhaseStartTime = 0;
+    return 0;
+}
+
+__declspec(dllexport) int __cdecl
+Wim_QueryCapture(
+    int* status,
+    int* phase,
+    double* percent,
+    int* elapsed_s,
+    int* remaining_s,
+    int* retcode)
+{
+    if (status)      *status = atomic_read32(&g_captureStatus);
+    if (phase)       *phase = atomic_read32(&g_capturePhase);
+    if (percent)     *percent = atomic_read32(&g_capturePercent) / pow(10.0, (double)atomic_read32(&g_capturePercentDecimal));
+    if (elapsed_s)   *elapsed_s = atomic_read32(&g_captureElapsed);
+    if (remaining_s) *remaining_s = atomic_read32(&g_captureRemaining);
+    if (retcode)     *retcode = atomic_read32(&g_captureRetcode);
+    return 0;
+}
+
+int __cdecl Wim_WaitCapture(void)
+{
+    if (!g_hCaptureThread)
+        return -102; /* aucun thread */
+    WaitForSingleObject(g_hCaptureThread, INFINITE);
+    CloseHandle(g_hCaptureThread);
+    g_hCaptureThread = NULL;
+    return atomic_read32(&g_captureRetcode);
+}
+
+
+/* ================================================================== */
+/*  APPEND                                                            */
+/* ================================================================== */
+static unsigned __stdcall AppendThread(void* unused)
+{
+    (void)unused;
+    atomic_write32(&g_appendStatus, 1); /* running */
+    g_appendStartTime = time(NULL);
+    atomic_write32(&g_appendPhase, 0);
+    g_appendPhaseStartTime = g_appendStartTime;
+    atomic_write32(&g_appendPercent, 0);
+    atomic_write32(&g_appendElapsed, 0);
+    atomic_write32(&g_appendRemaining, 0);
+    atomic_write32(&g_appendRetcode, 0);
+
+    const wchar_t* src = g_AppendSourcePath;
+    const wchar_t* dest = g_AppendDestinationPath;
+    int CompressionType = atomic_read32(&g_appendCompressionType);
+    int CompressionLevel = atomic_read32(&g_appendCompressionLevel);
+    int addFlags = atomic_read32(&g_appendAddFlags);
+    int WriteFlags = atomic_read32(&g_appendWriteFlags);
+    uint32_t chunkSize = (uint32_t)atomic_read32(&g_appendChunkSizeBytes);
+    int threads = atomic_read32(&g_appendThreadCount);
+
+    /* local name/desc resolved */
+    wchar_t nameBuf[512];
+    wchar_t descBuf[1024];
+    const wchar_t* nm = g_appendImageName;
+    const wchar_t* ds = g_appendImageDesc;
+    if (!nm || !*nm) {
+        derive_image_name(src, nameBuf, _countof(nameBuf));
+        nm = nameBuf;
+    }
+    if (!ds || !*ds) {
+        derive_image_desc(src, descBuf, _countof(descBuf));
+        ds = descBuf;
+    }
+
+    WIMStruct* Wim = NULL;
+    /* Open existing RW */
+    int ret = wimlib_open_wim(dest, WIMLIB_OPEN_FLAG_WRITE_ACCESS, &Wim);
+    if (ret != 0) goto done;
+
+    wimlib_register_progress_function(Wim, ProgressCallBack_Append, NULL);
+
+    /* Forcer compression/chunk UNIQUEMENT si CompressionType >= 0 */
+    if (CompressionType >= 0) {
+        enum wimlib_compression_type Compression_Type = (enum wimlib_compression_type)CompressionType;
+        (void)wimlib_set_output_compression_type(Wim, Compression_Type);
+
+        if (CompressionLevel > 0)
+            (void)wimlib_set_default_compression_level(Compression_Type, (unsigned int)CompressionLevel);
+
+        if (chunkSize > 0) {
+            uint32_t safe = sanitize_chunk_size(Compression_Type, chunkSize);
+            if (safe > 0)
+                (void)wimlib_set_output_chunk_size(Wim, safe);
+        }
+    }
+
+    /* Ajouter image */
+    ret = wimlib_add_image(Wim, src, nm, NULL, addFlags);
+    if (ret != 0) { wimlib_free(Wim); goto done; }
+
+    /* Mettre description sur la dernière image ajoutée */
+    struct wimlib_wim_info WimInfo;
+    if (wimlib_get_wim_info(Wim, &WimInfo) == 0) {
+        int newIdx = (int)WimInfo.image_count;
+        (void)wimlib_set_image_descripton(Wim, newIdx, ds);
+    }
+
+    /* Appliquer modifications */
+    ret = wimlib_overwrite(Wim, WriteFlags, threads);
+    wimlib_free(Wim);
+
+done:
+    atomic_write32(&g_appendRetcode, ret);
+    if (ret == 0) atomic_write32(&g_appendPercent, 100);
+    atomic_write32(&g_appendStatus, (ret == 0) ? 2 : 3);
+    _endthreadex(0);
+    return 0;
+}
+
+int __cdecl Wim_StartAppend(const wchar_t* srcDir,
+    const wchar_t* destWim,
+    const wchar_t* imageName,
+    const wchar_t* imageDesc,
+    int CompressionType,
+    int CompressionLevel,
+    int addFlags,
+    int writeFlags,
+    uint32_t chunkSizeBytes,
+    int threadCount)
+{
+    if (!srcDir || !destWim)
+        return WIMLIB_ERR_INVALID_PARAM;
+
+    if (atomic_read32(&g_appendStatus) == 1)
+        return -400; /* append déjà en cours */
+
+    wcsncpy_s(g_AppendSourcePath, _countof(g_AppendSourcePath), srcDir, _TRUNCATE);
+    wcsncpy_s(g_AppendDestinationPath, _countof(g_AppendDestinationPath), destWim, _TRUNCATE);
+
+    if (imageName)
+        wcsncpy_s(g_appendImageName, _countof(g_appendImageName), imageName, _TRUNCATE);
+    else
+        g_appendImageName[0] = 0;
+    if (imageDesc)
+        wcsncpy_s(g_appendImageDesc, _countof(g_appendImageDesc), imageDesc, _TRUNCATE);
+    else
+        g_appendImageDesc[0] = 0;
+
+    atomic_write32(&g_appendCompressionType, CompressionType);
+    atomic_write32(&g_appendCompressionLevel, CompressionLevel);
+    atomic_write32(&g_appendAddFlags, addFlags);
+    atomic_write32(&g_appendWriteFlags, writeFlags);
+    atomic_write32(&g_appendChunkSizeBytes, (LONG)chunkSizeBytes);
+    atomic_write32(&g_appendThreadCount, threadCount);
+
+    /* reset état */
+    atomic_write32(&g_appendStatus, 0);
+    atomic_write32(&g_appendPercent, 0);
+    atomic_write32(&g_appendElapsed, 0);
+    atomic_write32(&g_appendRemaining, 0);
+    atomic_write32(&g_appendRetcode, 0);
+
+    uintptr_t th = _beginthreadex(NULL, 0, AppendThread, NULL, 0, NULL);
+    if (!th)
+        return -401;
+    g_hAppendThread = (HANDLE)th;
+
+    atomic_write32(&g_appendPhase, 0);
+    g_appendPhaseStartTime = 0;
+    return 0;
+}
+
+__declspec(dllexport) int __cdecl
+Wim_QueryAppend(
+    int* status,
+    int* phase,
+    double* percent,
+    int* elapsed_s,
+    int* remaining_s,
+    int* retcode)
+{
+    if (status)      *status = atomic_read32(&g_appendStatus);
+    if (phase)       *phase = atomic_read32(&g_appendPhase);
+    if (percent)     *percent = atomic_read32(&g_appendPercent) / pow(10.0, (double)atomic_read32(&g_appendPercentDecimal));
+    if (elapsed_s)   *elapsed_s = atomic_read32(&g_appendElapsed);
+    if (remaining_s) *remaining_s = atomic_read32(&g_appendRemaining);
+    if (retcode)     *retcode = atomic_read32(&g_appendRetcode);
+    return 0;
+}
+
+int __cdecl Wim_WaitAppend(void)
+{
+    if (!g_hAppendThread)
+        return -402;
+    WaitForSingleObject(g_hAppendThread, INFINITE);
+    CloseHandle(g_hAppendThread);
+    g_hAppendThread = NULL;
+    return atomic_read32(&g_appendRetcode);
+}
+
+
+/* ================================================================== */
+/*  APPLY                                                             */
+/* ================================================================== */
+static unsigned __stdcall ApplyThread(void* unused)
+{
+    (void)unused;
+    atomic_write32(&g_extractStatus, 1); // running
+    g_extractStartTime = time(NULL);
+    atomic_write32(&g_extractPercent, 0);
+    atomic_write32(&g_extractElapsed, 0);
+    atomic_write32(&g_extractRemaining, 0);
+    atomic_write32(&g_extractRetcode, 0);
+
+    WIMStruct* wim = NULL;
+    int ret = wimlib_open_wim(g_applyWimPath, 0, &wim);
+    if (ret != 0) goto done;
+
+    int imageIndex = _wtoi(g_applyImageId);
+    if (imageIndex <= 0) {
+        imageIndex = wimlib_resolve_image(wim, g_applyImageId);
+        if (imageIndex <= 0) {
+            wimlib_free(wim);
+            ret = WIMLIB_ERR_INVALID_IMAGE;
+            goto done;
+        }
+    }
+
+    wimlib_register_progress_function(wim, ProgressCallBack_Extract, NULL);
+    ret = wimlib_extract_image(wim, imageIndex, g_applyDestPath, atomic_read32(&g_applyFlags));
+
+    wimlib_free(wim);
+
+done:
+    atomic_write32(&g_extractRetcode, ret);
+    atomic_write32(&g_extractStatus, (ret == 0) ? 2 : 3);
+    _endthreadex(0);
+    return 0;
+}
+
+int __cdecl Wim_StartApply(const wchar_t* wimFile, const wchar_t* imageId, const wchar_t* destDir, int extractFlags)
+{
+    if (!wimFile || !imageId || !destDir)
+        return WIMLIB_ERR_INVALID_PARAM;
+
+    wcsncpy_s(g_applyWimPath, _countof(g_applyWimPath), wimFile, _TRUNCATE);
+    wcsncpy_s(g_applyImageId, _countof(g_applyImageId), imageId, _TRUNCATE);
+    wcsncpy_s(g_applyDestPath, _countof(g_applyDestPath), destDir, _TRUNCATE);
+    atomic_write32(&g_applyFlags, extractFlags);
+
+    uintptr_t hThread = _beginthreadex(NULL, 0, ApplyThread, NULL, 0, NULL);
+    if (hThread) CloseHandle((HANDLE)hThread);
+
+    return 0;
+}
+
+__declspec(dllexport) int __cdecl
+Wim_QueryApply(
+    int* status,
+    int* phase,
+    double* percent,
+    int* elapsed_s,
+    int* remaining_s,
+    int* retcode)
+{
+    if (status)      *status = atomic_read32(&g_extractStatus);
+    if (phase)       *phase = atomic_read32(&g_extractPhase);
+    if (percent)     *percent = atomic_read32(&g_extractPercent) / pow(10.0, (double)atomic_read32(&g_extractPercentDecimal));
+    if (elapsed_s)   *elapsed_s = atomic_read32(&g_extractElapsed);
+    if (remaining_s) *remaining_s = atomic_read32(&g_extractRemaining);
+    if (retcode)     *retcode = atomic_read32(&g_extractRetcode);
+    return 0;
+}
+
+
+/* ================================================================== */
+/*  SPLIT                                                             */
+/* ================================================================== */
+int __cdecl Wim_StartSplit(
+    const wchar_t* srcWim,
+    const wchar_t* partPathFmt,
+    uint64_t partSize,
+    int writeFlags)
+{
+    if (!srcWim || !partPathFmt || partSize == 0)
+        return WIMLIB_ERR_INVALID_PARAM;
+
+    if (atomic_read32(&g_splitStatus) == 1)
+        return -600; // déjà en cours
+
+    atomic_write32(&g_splitStatus, 1);  // running
+    atomic_write32(&g_splitPercent, 0);
+    atomic_write32(&g_splitRetcode, 0);
+
+    WIMStruct* wim = NULL;
+    int ret = wimlib_open_wim(srcWim, 0, &wim); // Lecture seule
+    if (ret != 0) {
+        atomic_write32(&g_splitRetcode, ret);
+        atomic_write32(&g_splitStatus, 3);
+        return ret;
+    }
+
+    wimlib_register_progress_function(wim, ProgressCallBack_Split, NULL);
+
+    ret = wimlib_split(wim, partPathFmt, partSize, writeFlags);
+    wimlib_free(wim);
+
+    atomic_write32(&g_splitRetcode, ret);
+    if (ret == 0) atomic_write32(&g_splitPercent, 100);
+    atomic_write32(&g_splitStatus, (ret == 0) ? 2 : 3);
+    return ret;
+}
+
+__declspec(dllexport) double __cdecl Wim_GetSplitProgress(void)
+{
+    return atomic_read32(&g_splitPercent) / pow(10.0, (double)atomic_read32(&g_splitPercentDecimal));
+}
+
+
+/* ================================================================== */
+/*  VERIFY                                                            */
+/* ================================================================== */
+static unsigned __stdcall VerifyThread(void* unused)
+{
+    (void)unused;
+    atomic_write32(&g_verifyStatus, 1);
+    atomic_write32(&g_verifyPercent, 0);
+    atomic_write32(&g_verifyRetcode, 0);
+
+    int verifyFlags = atomic_read32(&g_verifyFlags);
+
+    WIMStruct* w = NULL;
+    int ret = wimlib_open_wim(g_VerifyPath, 0 /* read-only */, &w);
+    if (ret == 0) {
+        wimlib_register_progress_function(w, ProgressCallBack_Verify, NULL);
+        ret = wimlib_verify_wim(w, verifyFlags);
+        wimlib_free(w);
+    }
+
+    atomic_write32(&g_verifyRetcode, ret);
+    if (ret == 0) atomic_write32(&g_verifyPercent, 100);
+    atomic_write32(&g_verifyStatus, (ret == 0) ? 2 : 3);
+    _endthreadex(0);
+    return 0;
+}
+
+int __cdecl Wim_StartVerify(const wchar_t* wimPath, int verifyFlags)
+{
+    if (!wimPath)
+        return WIMLIB_ERR_INVALID_PARAM;
+
+    if (atomic_read32(&g_verifyStatus) == 1)
+        return -300; /* déjà en cours */
+
+    wcsncpy_s(g_VerifyPath, _countof(g_VerifyPath), wimPath, _TRUNCATE);
+    atomic_write32(&g_verifyFlags, verifyFlags);
+
+    atomic_write32(&g_verifyStatus, 0);
+    atomic_write32(&g_verifyPercent, 0);
+    atomic_write32(&g_verifyRetcode, 0);
+
+    uintptr_t th = _beginthreadex(NULL, 0, VerifyThread, NULL, 0, NULL);
+    if (!th)
+        return -301;
+    g_hVerifyThread = (HANDLE)th;
+    return 0;
+}
+
+int __cdecl Wim_QueryVerify(int* status, double* percent, int* retcode)
+{
+    if (status)  *status = atomic_read32(&g_verifyStatus);
+    if (percent) *percent = atomic_read32(&g_verifyPercent) / pow(10.0, (double)atomic_read32(&g_verifyPercentDecimal));
+    if (retcode) *retcode = atomic_read32(&g_verifyRetcode);
+    return 0;
+}
+
+int __cdecl Wim_WaitVerify(void)
+{
+    if (!g_hVerifyThread)
+        return -302;
+    WaitForSingleObject(g_hVerifyThread, INFINITE);
+    CloseHandle(g_hVerifyThread);
+    g_hVerifyThread = NULL;
+    return atomic_read32(&g_verifyRetcode);
+}
