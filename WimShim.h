@@ -33,6 +33,15 @@ extern "C" {
     __declspec(dllexport) int __cdecl Wim_Cancel(void);
 
     /* ================================================================
+     *  Capture configuration file (wimcapture --config format: [ExclusionList]...)
+     *  used by the next Wim_StartCapture / Wim_StartAppend. NULL or "" = none.
+     *  Returns 0, WIM_SHIM_ERR_BUSY, or WIMLIB_ERR_OPEN if the file is missing.
+     *  Solid mode: pass WIMLIB_WRITE_FLAG_SOLID in writeFlags; CompressionType and
+     *  chunkSizeBytes then apply to the solid resources (wimcapture --solid).
+     * ================================================================ */
+    __declspec(dllexport) int __cdecl Wim_SetCaptureConfig(const wchar_t* configPath);
+
+    /* ================================================================
      *  Modify an existing WIM (synchronous)
      *  imageIndex = -1 (WIMLIB_ALL_IMAGES) accepted by DeleteImage / ExportImage.
      *  Empty value => property removed.  bootIndex 0 => no boot image.

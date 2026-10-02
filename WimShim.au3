@@ -3,18 +3,13 @@
 ; AutoIt Version : 3.3.14.5
 ; Description ...: Functions for creating and manipulating WIM images.
 ; Author(s) .....: Jonathan Larochelle (MadDogVachon)
-; Dll ...........: WimShim.dll, libwim-15.dll (64 bits version of libwim-15.dll only)
+; Dll ...........: WimShim.dll, libwim-15.dll (64-bit only: run with a 64-bit AutoIt)
 ; ===============================================================================================================================
 
 #include-once
-#include <WinAPIFiles.au3>
-#include <Array.au3>
-#include <MsgBoxConstants.au3>
 
-If Not @AutoItX64 Then
-	MsgBox($MB_OK + $MB_ICONERROR + $MB_TASKMODAL + $MB_TOPMOST, "Error", "The library only works with the 64-bit AutoIt (AutoIt3_x64.exe)")
-	Exit
-EndIf
+; The library only works with the 64-bit AutoIt (AutoIt3_x64.exe): Wim_LoadDLL() then fails with @error = 1.
+; (No Exit here: including the UDF must never close the host script.)
 
 
 ; #CONSTANTS# ===================================================================================================================
@@ -346,6 +341,18 @@ EndFunc
 ; ======================================================================
 ; Job control (one asynchronous job at a time: capture, append, apply, split, verify)
 ; ======================================================================
+; Capture configuration file (wimcapture --config format, e.g. [ExclusionList]) used by the next
+; Wim_StartCapture / Wim_StartAppend. "" = none (nothing excluded).
+; Returns 0, $WIM_SHIM_ERR_BUSY, or $WIMLIB_ERR_OPEN if the file does not exist.
+; Solid compression (wimcapture --solid): add $WIMLIB_WRITE_FLAG_SOLID to the write flags; the compression
+; type, level and chunk size then apply to the solid resources (LZMS chunk up to 1 GiB).
+Func Wim_SetCaptureConfig($sConfigFile = "")
+    Local $aRet = DllCall($g_hWim, "int:cdecl", "Wim_SetCaptureConfig", _
+        "wstr",     $sConfigFile)
+    If @error Then Return -1
+    Return $aRet[0]
+EndFunc
+
 ; 1 while the worker thread runs
 Func Wim_IsRunning()
     Local $aRet = DllCall($g_hWim, "int:cdecl", "Wim_IsRunning")

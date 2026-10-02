@@ -59,13 +59,16 @@
     </Link>
     <PostBuildEvent>
       <Command>copy /y "$(ProjectDir)libwim-15.dll" "$(OutDir)" &gt;nul</Command>
-    </PostBuildEvent>  </ItemDefinitionGroup>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
+      <!-- Static CRT: WinPE/WinRE has no VC++ runtime (vcruntime140.dll) -->
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PreprocessorDefinitions>NDEBUG;WIMSHIM_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
@@ -78,7 +81,8 @@
     </Link>
     <PostBuildEvent>
       <Command>copy /y "$(ProjectDir)libwim-15.dll" "$(OutDir)" &gt;nul</Command>
-    </PostBuildEvent>  </ItemDefinitionGroup>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="pch.h" />

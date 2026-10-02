@@ -156,6 +156,7 @@ static wchar_t g_ScanUnit[10];
 /*  Append, Capture                                                   */
 static wchar_t g_ImageName[512];
 static wchar_t g_ImageDesc[1024];
+static wchar_t g_CaptureConfig[MAX_PATH * 4];           /* capture configuration file ("" = none), see Wim_SetCaptureConfig */
 static volatile LONG g_CompressionType = WIMLIB_COMPRESSION_TYPE_LZX;
 static volatile LONG g_CompressionLevel = 50;
 static volatile LONG g_ChunkSizeBytes = 0;
@@ -1458,6 +1459,18 @@ __declspec(dllexport) int __cdecl Wim_Cancel(void)
     return 0;
 }
 
+/* Capture configuration file (exclusion list, wimcapture --config format) used by the next
+ * captures / appends. NULL or "" = no configuration (nothing excluded). */
+__declspec(dllexport) int __cdecl Wim_SetCaptureConfig(const wchar_t* configPath)
+{
+    if (Wim_IsRunning())
+        return WIM_SHIM_ERR_BUSY;
+    if (configPath && *configPath && GetFileAttributesW(configPath) == INVALID_FILE_ATTRIBUTES)
+        return WIMLIB_ERR_OPEN;
+    shim_wcsncpyz(g_CaptureConfig, _countof(g_CaptureConfig), configPath);
+    return 0;
+}
+
 static void store_name_desc(const wchar_t* imageName, const wchar_t* imageDesc)
 {
     shim_wcsncpyz(g_ImageName, _countof(g_ImageName), imageName);
@@ -1506,13 +1519,20 @@ static unsigned __stdcall CaptureThread(void* unused)
     wimlib_register_progress_function(Wim, ProgressCallBack, NULL);
 
     /* capture source -> new image w/ name */
-    ret = wimlib_add_image(Wim, g_SourceFolderPath, nm, NULL, addFlags);
+    ret = wimlib_add_image(Wim, g_SourceFolderPath, nm, g_CaptureConfig[0] ? g_CaptureConfig : NULL, addFlags);
     if (ret != 0) { wimlib_free(Wim); goto done; }
 
     /* set description (image just added = #1) */
     (void)wimlib_set_image_description(Wim, 1, ds);
 
-    if (chunkSize > 0)
+    /* Solid mode (like wimcapture --solid): chunk size / compression apply to the solid resources. */
+    if (writeFlags & WIMLIB_WRITE_FLAG_SOLID) {
+        if (CompressionType != WIMLIB_COMPRESSION_TYPE_NONE)
+            (void)wimlib_set_output_pack_compression_type(Wim, CompressionType);
+        if (chunkSize > 0)
+            (void)wimlib_set_output_pack_chunk_size(Wim, chunkSize);
+    }
+    else if (chunkSize > 0)
         (void)wimlib_set_output_chunk_size(Wim, chunkSize);
 
     ret = wimlib_write(Wim, g_DestinationFilePath, WIMLIB_ALL_IMAGES, writeFlags, threads);
@@ -1617,15 +1637,19 @@ static unsigned __stdcall AppendThread(void* unused)
         if (CompressionLevel > 0)
             (void)wimlib_set_default_compression_level(Compression_Type, (unsigned int)CompressionLevel);
 
-        if (chunkSize > 0) {
-            uint32_t safe = sanitize_chunk_size(Compression_Type, chunkSize);
+        uint32_t safe = sanitize_chunk_size(Compression_Type, chunkSize);
+        if (WriteFlags & WIMLIB_WRITE_FLAG_SOLID) {
+            if (Compression_Type != WIMLIB_COMPRESSION_TYPE_NONE)
+                (void)wimlib_set_output_pack_compression_type(Wim, Compression_Type);
             if (safe > 0)
-                (void)wimlib_set_output_chunk_size(Wim, safe);
+                (void)wimlib_set_output_pack_chunk_size(Wim, safe);
         }
+        else if (safe > 0)
+            (void)wimlib_set_output_chunk_size(Wim, safe);
     }
 
     /* Ajouter image */
-    ret = wimlib_add_image(Wim, g_SourceFolderPath, nm, NULL, addFlags);
+    ret = wimlib_add_image(Wim, g_SourceFolderPath, nm, g_CaptureConfig[0] ? g_CaptureConfig : NULL, addFlags);
     if (ret != 0) { wimlib_free(Wim); goto done; }
 
     /* Mettre description sur la dernière image ajoutée */

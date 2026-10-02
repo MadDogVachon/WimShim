@@ -59,6 +59,7 @@ Func _Main()
         _T_Validation()
         _CreateData()
         _T_Capture()
+        _T_ConfigSolid()
         _T_Info()
         _T_Verify()
         _T_Append()
@@ -299,6 +300,81 @@ Func _T_Capture()
         _Check(Wim_WaitCapture() = 0, "capture with 2 threads")
         _Check(_Wim_Rc(Wim_GetWimInfo($sWim)) = 0, "  resulting wim is valid")
     EndIf
+EndFunc
+
+
+; ================================================================
+; 3b. Capture configuration file (exclusions) and solid compression
+; ================================================================
+Func _T_ConfigSolid()
+    _Section("Capture config (exclusions) / solid compression")
+    Local $sCfg = $g_sRoot & "\exclusions.ini"
+    FileDelete($sCfg)
+    FileWrite($sCfg, "[ExclusionList]" & @CRLF & "\docs" & @CRLF & "*.bin.tmp" & @CRLF & "\data\duplicate_of_random1.bin" & @CRLF)
+    FileWrite($g_sCapture & "\scratch.bin.tmp", "temporary")    ; excluded by the wildcard
+    Local $iFiles, $iDirs, $iBytes
+    _CountTree($g_sCapture, $iFiles, $iDirs, $iBytes)
+    Local $iDocsFiles, $iDocsDirs, $iDocsBytes
+    _CountTree($g_sCapture & "\docs", $iDocsFiles, $iDocsDirs, $iDocsBytes)
+    Local $iExpected = $iFiles - $iDocsFiles - 2                ; docs content, scratch.bin.tmp, duplicate
+
+    _Check(Wim_SetCaptureConfig($g_sRoot & "\no_such_config.ini") = $WIMLIB_ERR_OPEN, "SetCaptureConfig on a missing file -> ERR_OPEN")
+    _Check(Wim_SetCaptureConfig($sCfg) = 0, "SetCaptureConfig(exclusions.ini)")
+
+    Local $sWim = $g_sRoot & "\excluded.wim"
+    Local $rc = Wim_StartCapture($g_sCapture, $sWim, "Excl", "", $WIMLIB_COMPRESSION_TYPE_XPRESS)
+    $rc = ($rc = 0) ? Wim_WaitCapture() : $rc
+    _Check($rc = 0, "capture with the exclusion list", "rc=" & $rc & " " & Wim_ErrorString($rc))
+    Local $aImg = Wim_GetImageInfoEx($sWim, 1)
+    _Check(IsArray($aImg) And $aImg[6] = $iExpected, "  excluded files are not in the image", (IsArray($aImg) ? $aImg[6] : "?") & " vs " & $iExpected)
+    Local $sDest = $g_sRoot & "\ApplyExcl"
+    DirCreate($sDest)
+    $rc = Wim_StartApply($sWim, "1", $sDest)
+    $rc = ($rc = 0) ? Wim_WaitApply() : $rc
+    _Check($rc = 0 And Not FileExists($sDest & "\docs") And Not FileExists($sDest & "\scratch.bin.tmp") And Not FileExists($sDest & "\data\duplicate_of_random1.bin") And FileExists($sDest & "\data\random1.bin"), "  applied tree has no excluded entries", "rc=" & $rc)
+    DirRemove($sDest, 1)
+
+    ; the configuration is used by Append too
+    $rc = Wim_StartAppend($g_sCapture, $sWim, "Excl2")
+    $rc = ($rc = 0) ? Wim_WaitAppend() : $rc
+    $aImg = Wim_GetImageInfoEx($sWim, 2)
+    _Check($rc = 0 And IsArray($aImg) And $aImg[6] = $iExpected, "  append uses the exclusion list too", "rc=" & $rc)
+
+    _Check(Wim_SetCaptureConfig("") = 0, "SetCaptureConfig("""") removes the configuration")
+    $sWim = $g_sRoot & "\noexcl.wim"
+    $rc = Wim_StartCapture($g_sCapture, $sWim, "NoExcl", "", $WIMLIB_COMPRESSION_TYPE_XPRESS)
+    $rc = ($rc = 0) ? Wim_WaitCapture() : $rc
+    $aImg = Wim_GetImageInfoEx($sWim, 1)
+    _Check($rc = 0 And IsArray($aImg) And $aImg[6] = $iFiles, "  next capture includes everything again", (IsArray($aImg) ? $aImg[6] : "?") & " vs " & $iFiles)
+    FileDelete($g_sCapture & "\scratch.bin.tmp")
+
+    ; --- solid: same presets as Utilitaires.au3 "Ultra" (LZMS:25, 128M) and "Maximum" (LZMS:50, 2M)
+    Local $sSig = _TreeSig($g_sCapture)
+    Local $aPresets[2] = ["25|" & 128 * $MB & "|Ultra (solid LZMS:25, 128M)", "50|" & 2 * $MB & "|Maximum (solid LZMS:50, 2M)"]
+    For $i = 0 To 1
+        Local $aP = StringSplit($aPresets[$i], "|", 2)
+        $sWim = $g_sRoot & "\solid" & $i & ".wim"
+        _ProgressBegin("Capture " & $aP[2])
+        $rc = Wim_StartCapture($g_sCapture, $sWim, "Solid", "", $WIMLIB_COMPRESSION_TYPE_LZMS, Number($aP[0]), (IsAdmin() ? $WIMLIB_ADD_FLAG_STRICT_ACLS : 0), _
+                BitOR($WIMLIB_WRITE_FLAG_SOLID, $WIMLIB_WRITE_FLAG_CHECK_INTEGRITY), Number($aP[1]), 0)
+        _Check($rc = 0, "StartCapture " & $aP[2], "rc=" & $rc)
+        If $rc <> 0 Then ContinueLoop
+        $rc = _WaitJob("capture")
+        _Check($rc = 0, "  capture OK", "rc=" & $rc & " " & Wim_ErrorString($rc))
+        _CheckProgressSamples("  progress")
+        Local $a = Wim_GetWimInfo($sWim)
+        _Check(IsArray($a) And $a[0] = 0 And $a[4] = 1, "  valid wim with integrity table")
+        _Check(FileGetSize($sWim) > 0 And FileGetSize($sWim) < $g_iCapBytes, "  solid wim smaller than the source data", FileGetSize($sWim) & " vs " & $g_iCapBytes)
+        Local $rcV = Wim_StartVerify($sWim)
+        $rcV = ($rcV = 0) ? Wim_WaitVerify() : $rcV
+        _Check($rcV = 0, "  verify OK", "rc=" & $rcV)
+        $sDest = $g_sRoot & "\ApplySolid"
+        DirCreate($sDest)
+        $rc = Wim_StartApply($sWim, "1", $sDest)
+        $rc = ($rc = 0) ? Wim_WaitApply() : $rc
+        _Check($rc = 0 And _TreeSig($sDest) == $sSig, "  applied tree identical to the source", "rc=" & $rc)
+        DirRemove($sDest, 1)
+    Next
 EndFunc
 
 
